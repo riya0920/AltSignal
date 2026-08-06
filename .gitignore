@@ -1,0 +1,8 @@
+# generated synthetic data (rebuild with: python -m src.generate)
+data/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
