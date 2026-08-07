@@ -1,119 +1,170 @@
-"""AltSignal Step 2 - the deliberately wrong naive backtest.
+"""AltSignal Step 2 - the naive backtest. Deliberately wrong, on purpose.
 
-This is the sloppy baseline. Every protection is omitted on purpose so we can record
-how many pure-noise vendors survive. It is SUPPOSED to produce wrong answers. The four
-deliberate mistakes, none of which we fix here:
+Every protection is omitted here. There is no train/test split, no correction for the fact
+that twelve vendors were tested, and no penalty for the nine configurations tried per vendor.
+The point is to establish the baseline: how badly does a rushed, honest-looking evaluation
+mislead you? Steps 3-5 are measured against this row.
 
-  1. Fit and evaluate on the same full 1500-day sample. No train/test split.
-  2. Search a grid of configs per vendor and keep only the best-scoring one.
-  3. Report the maximum across twelve vendors with no multiple-testing correction.
-  4. Report raw in-sample Sharpe with no deflation.
+Nothing is fitted. There is no model anywhere in this file - a vendor's numbers are turned
+into a long/short book by arithmetic, the book is multiplied by what actually happened, and
+the result is scored. The overfitting comes entirely from SELECTION: running that arithmetic
+nine ways and keeping the best. Selection alone is enough to turn a money-losing null vendor
+into an impressive-looking one.
 
-answer_key.csv is joined in for display only AFTER all scoring is complete, never
-used in the decision logic.
+score_all() is pure - arrays in, dataframe out, no files, no printing - so src/robustness.py
+can call it inside a loop over seeds. main() is the thin wrapper that loads data/, writes
+results/step2_naive.csv, and prints the scorecard.
 
-Run:  python -m src.naive      (from the repo root, after src.generate)
+Run:  python -m src.naive      (from the repo root, after python -m src.generate)
 """
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-DATA = Path("data")
-RESULTS = Path("results")
-RESULTS.mkdir(exist_ok=True)
+# --- the configuration grid: 3 smoothing windows x 3 concentration levels = 9 trials ---
+# Smoothing exploits factor momentum; concentration exploits conviction. Neither is
+# unreasonable on its own, which is exactly why searching over them is so easy to justify
+# to yourself and so damaging in practice.
+SMOOTH_WINDOWS = (1, 5, 20)
+TOP_K = (None, 50, 25)          # None = hold all names; 50 = 50 long + 50 short; etc.
 
-returns = np.load(DATA / "returns.npy")                 # (1500, 400)
-vendors_npz = np.load(DATA / "vendors.npz")
-vendors = {k: vendors_npz[k] for k in vendors_npz.files}
+CONFIGS = [
+    (f"smooth{s}_" + ("all" if k is None else f"top{k}"), s, k)
+    for s in SMOOTH_WINDOWS
+    for k in TOP_K
+]
 
-# config grid: 3 smoothing windows x 3 concentrations = 9 configs per vendor
-SMOOTH_WINDOWS = [1, 5, 20]
-CONCENTRATIONS = [("all", None), ("top50", 50), ("top25", 25)]
+# The one configuration a disciplined analyst would have committed to in advance: no
+# smoothing, hold everything. Its score is reported as single_sharpe, and the gap between
+# it and best_sharpe is the measurable cost of having looked nine times.
+DEFAULT_CONFIG = "smooth1_all"
 
 
-def smooth(sig, window):
-    """Trailing mean over `window` days (window=1 is a no-op)."""
-    if window == 1:
+def smooth(sig, n):
+    """Trailing n-day mean of the signal. The first n rows are left raw (no history yet)."""
+    if n == 1:
         return sig
-    return pd.DataFrame(sig).rolling(window, min_periods=1).mean().to_numpy()
-
-
-def concentrate(w, k):
-    """Keep only the k largest longs and k largest shorts per day, else keep all."""
-    if k is None:
-        return w
-    out = np.zeros_like(w)
-    for t in range(w.shape[0]):
-        row = w[t]
-        longs = np.argsort(row)[-k:]      # k most positive
-        shorts = np.argsort(row)[:k]      # k most negative
-        keep = np.concatenate([longs, shorts])
-        out[t, keep] = row[keep]
+    c = np.cumsum(sig, axis=0)
+    out = np.empty_like(sig)
+    out[:n] = sig[:n]
+    out[n:] = (c[n:] - c[:-n]) / n
     return out
 
 
-def sharpe_for_config(sig, window, k):
-    """Build a dollar-neutral long/short book from a vendor signal and return its
-    annualised in-sample Sharpe. Vendor row t is applied to returns[t+1]."""
-    s = smooth(sig, window)
+def top_k(sig, k):
+    """Keep only the k most-liked and k most-disliked names, at equal weight.
 
-    # 2.1 dollar-neutral weights: demean per day (kills market exposure), gross = 1
-    w = s - s.mean(axis=1, keepdims=True)
-    w = concentrate(w, k)
-    gross = np.abs(w).sum(axis=1, keepdims=True)
-    gross[gross == 0] = 1.0
-    w = w / gross
+    Discards the vendor's conviction in the middle of the book. Concentration raises both
+    the return and the variance, so whether it helps is a matter of luck on any given draw -
+    which is precisely why it makes a useful knob for the search to abuse.
+    """
+    if k is None:
+        return sig
+    out = np.zeros_like(sig)
+    idx = np.argsort(sig, axis=1)
+    rows = np.arange(sig.shape[0])[:, None]
+    out[rows, idx[:, -k:]] = 1.0
+    out[rows, idx[:, :k]] = -1.0
+    return out
 
-    # 2.2 P&L: vendor row t predicts return t+1. Assert alignment - an off-by-one
-    # here is look-ahead bias and silently inflates everything.
-    fwd = returns[1:]                       # (1499, 400), aligned to vendor rows
-    assert w.shape == fwd.shape, f"shape mismatch {w.shape} vs {fwd.shape}"
-    pnl = (w * fwd).sum(axis=1)
+
+def weights(sig):
+    """Dollar-neutral long/short book with gross exposure 1.
+
+    Demeaning each day removes the market factor, so the book bets on the CROSS-SECTIONAL
+    ranking rather than on the market going up. Note this weights by conviction: being right
+    about your large positions matters more than being right often.
+    """
+    w = sig - sig.mean(axis=1, keepdims=True)
+    return w / np.abs(w).sum(axis=1, keepdims=True)
+
+
+def sharpe(sig, fwd):
+    """Annualised Sharpe of the book implied by sig, applied to next-day returns fwd.
+
+    Row t of sig is aligned to fwd[t], which is the return on day t+1. Getting this
+    off by one is look-ahead bias and silently inflates everything downstream.
+    """
+    pnl = (weights(sig) * fwd).sum(axis=1)
     sd = pnl.std()
     if sd == 0:
         return 0.0
     return pnl.mean() / sd * np.sqrt(252)
 
 
-rows = []
-for name, sig in vendors.items():
-    single = sharpe_for_config(sig, window=1, k=None)   # default: smoothing 1, all names
-    best_sharpe, best_config = single, "smooth1_all"
-    for window in SMOOTH_WINDOWS:
-        for cname, k in CONCENTRATIONS:
-            sh = sharpe_for_config(sig, window, k)
-            if sh > best_sharpe:
-                best_sharpe, best_config = sh, f"smooth{window}_{cname}"
-    rows.append(
-        {
+def score_vendor(sig, fwd):
+    """Score one vendor across all nine configs. Returns (single, best, best_label)."""
+    scores = {}
+    for label, s, k in CONFIGS:
+        scores[label] = sharpe(top_k(smooth(sig, s), k), fwd)
+    best_label = max(scores, key=scores.get)
+    return scores[DEFAULT_CONFIG], scores[best_label], best_label
+
+
+def score_all(returns, vendors):
+    """Run the naive backtest over every vendor. Pure: no files, no printing.
+
+    returns : (n_days, n_assets)
+    vendors : dict of name -> (n_days-1, n_assets)
+
+    Returns a dataframe sorted by best_sharpe descending. The answer key is NOT touched
+    here; callers join true_ic in afterwards, for display only.
+    """
+    fwd = returns[1:]
+    rows = []
+    for name, sig in vendors.items():
+        single, best, label = score_vendor(sig, fwd)
+        rows.append({
             "vendor": name,
-            "single_sharpe": round(single, 4),
-            "best_sharpe": round(best_sharpe, 4),
-            "best_config": best_config,
-            "n_configs_tried": len(SMOOTH_WINDOWS) * len(CONCENTRATIONS),
-        }
-    )
+            "single_sharpe": single,
+            "best_sharpe": best,
+            "best_config": label,
+            "n_configs_tried": len(CONFIGS),
+        })
+    return (pd.DataFrame(rows)
+            .sort_values("best_sharpe", ascending=False)
+            .reset_index(drop=True))
 
-table = pd.DataFrame(rows).sort_values("best_sharpe", ascending=False).reset_index(drop=True)
-table.to_csv(RESULTS / "step2_naive.csv", index=False)
 
-# --- join the answer key for DISPLAY ONLY, after all scoring is done ---
-key = pd.read_csv(DATA / "answer_key.csv")
-display = table.merge(key, on="vendor", how="left")
-display["kind"] = np.where(display["true_ic"] > 0, "REAL", "fake")
+def main():
+    returns = np.load("data/returns.npy")
+    vendors = dict(np.load("data/vendors.npz"))
+    key = pd.read_csv("data/answer_key.csv")
 
-print("STEP 2 NAIVE BACKTEST  (sorted by best_sharpe)")
-print(display.to_string(index=False))
+    df = score_all(returns, vendors)
 
-fakes = display[display["true_ic"] == 0]
-reals = display[display["true_ic"] > 0]
-top = display.iloc[0]
+    # answer key joined for DISPLAY ONLY, after all scoring is complete
+    df = df.merge(key, on="vendor", how="left")
+    df["kind"] = np.where(df["true_ic"] > 0, "REAL", "fake")
 
-print("\nSUMMARY")
-print(f"  zero-IC vendors clearing Sharpe 1.0 (best-of-9):  {(fakes['best_sharpe'] > 1.0).sum()} of {len(fakes)}")
-print(f"  zero-IC vendors clearing Sharpe 0.5 (best-of-9):  {(fakes['best_sharpe'] > 0.5).sum()} of {len(fakes)}")
-print(f"  top-ranked vendor overall:  {top['vendor']}  ->  {top['kind']}  (best_sharpe {top['best_sharpe']:.2f})")
-print(f"  max best_sharpe anywhere:   {display['best_sharpe'].max():.2f}   (a value > 5 signals a breadth/leakage bug)")
-mean_gap = (display['best_sharpe'] - display['single_sharpe']).mean()
-print(f"  mean best-minus-single gap: {mean_gap:.2f}   (the cost of knob-twisting)")
+    out = Path("results")
+    out.mkdir(exist_ok=True)
+    df.to_csv(out / "step2_naive.csv", index=False)
+
+    pd.set_option("display.width", 140)
+    print("STEP 2 NAIVE BACKTEST  (sorted by best_sharpe)")
+    print(df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+    fakes = df[df["true_ic"] == 0]
+    reals = df[df["true_ic"] > 0]
+    # An inversion is the finding that matters: a vendor with ZERO true skill scoring above
+    # a vendor with real skill. Unlike a Sharpe threshold, this needs no arbitrary cutoff.
+    inversions = int((fakes["best_sharpe"].values[:, None] > reals["best_sharpe"].values).sum())
+
+    print("\nSUMMARY")
+    print(f"  top-ranked vendor overall:   {df.iloc[0]['vendor']} -> {df.iloc[0]['kind']}"
+          f"  (best_sharpe {df.iloc[0]['best_sharpe']:.2f})")
+    print(f"  max best_sharpe anywhere:    {df['best_sharpe'].max():.2f}"
+          f"   (a value > 5 signals a breadth/leakage bug)")
+    print(f"  best fake:                   {fakes.iloc[0]['vendor']}"
+          f"  ({fakes.iloc[0]['best_sharpe']:.2f}, single {fakes.iloc[0]['single_sharpe']:.2f})")
+    print(f"  fake-over-real inversions:   {inversions}"
+          f"   (zero-skill vendors outranking genuine ones)")
+    print(f"  mean best-minus-single gap:  {(df['best_sharpe'] - df['single_sharpe']).mean():.2f}"
+          f"   (the cost of knob-twisting)")
+    print("\n  NOTE: this is one seed. See src/robustness.py for the distribution.")
+
+
+if __name__ == "__main__":
+    main()
