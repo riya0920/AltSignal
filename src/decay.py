@@ -31,6 +31,8 @@ Run:  python -m src.decay
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from src.turnover import apply_rate
+
 
 from src.naive import CONFIGS, smooth, top_k, weights
 
@@ -77,9 +79,10 @@ def half_life(decay, horizons=HORIZONS):
     return float(np.log(0.5) / slope) if slope < 0 else float("inf")
 
 
+
 def ensemble_weights(sig):
-    """Positions of the Step 3 ensemble book: the nine config books, equally weighted."""
-    return np.mean([weights(top_k(smooth(sig, s), k)) for _, s, k in CONFIGS], axis=0)
+    tgt = np.mean([weights(top_k(smooth(sig, s), k)) for _, s, k in CONFIGS], axis=0)
+    return apply_rate(tgt, 0.20)
 
 
 def cost_curve(sig, fwd, costs=COST_BPS):
