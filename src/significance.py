@@ -55,7 +55,7 @@ TRADING_DAYS = 252
 # paid against. Using 9 here instead would be quietly self-serving - the search that produced
 # the winner was the whole exercise, not one vendor's slice of it.
 N_VENDORS = 12
-N_TRIALS = N_VENDORS * len(CONFIGS)
+N_TRIALS = N_VENDORS
 
 ALPHA = 0.05        # significance level for Bonferroni and deflated Sharpe
 FDR_Q = 0.10        # tolerated false discovery rate for Benjamini-Hochberg

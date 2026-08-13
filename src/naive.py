@@ -77,7 +77,11 @@ def weights(sig):
     about your large positions matters more than being right often.
     """
     w = sig - sig.mean(axis=1, keepdims=True)
-    return w / np.abs(w).sum(axis=1, keepdims=True)
+    gross = np.abs(w).sum(axis=1, keepdims=True)
+    # A quarterly signal has no view on days after the final print; those rows are exactly
+    # zero. Dividing them produces NaN that propagates silently through every Sharpe
+    # downstream. Flat days are a real feature of the signal, so they are held flat.
+    return np.divide(w, gross, out=np.zeros_like(w), where=gross > 0)
 
 
 def sharpe(sig, fwd):

@@ -28,7 +28,7 @@ from src.naive import CONFIGS, smooth, top_k, weights
 # --- fold geometry ---
 # Rolling, not expanding: markets change regime, and a 2018 training block should not still
 # be steering a 2024 decision. At n=1499 these values yield 7 folds covering 882 test days.
-TRAIN_DAYS = 378        # ~2 years of selection data
+TRAIN_DAYS = 504        # ~2 years of selection data
 TEST_DAYS = 126         # ~6 months of evaluation
 PURGE_DAYS = 25         # gap between train end and test start
 EMBARGO_DAYS = 25       # gap after a test block before it may re-enter a later training set
