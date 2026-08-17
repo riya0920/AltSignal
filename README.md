@@ -103,15 +103,61 @@ results/           one CSV per module, plus the *_sweep.csv multi-seed summaries
 NOTES.md           design notes for the generator and the two tensions in the original spec
 ```
 
-## What the pipeline finds (seed 42, return-driven world)
+## Demo: one seed, start to finish
 
-- Provenance discards several thousand vendor-days of reconstructed history before anything is scored.
-- Significance leaves a handful of vendors, a clear majority of them real.
-- Economics removes the survivors that cannot cover trading cost.
-- On the sealed holdout, the bought vendors outperform the rejected ones. That gap, not the
-  precision against the answer key, is the number a real desk could actually observe.
+Three commands, on the default seed 42. All output below is real.
 
-Numbers move seed to seed, which is the point: run any module with `--sweep` for the
+**1. Build the world.** Thirty vendors, five of them real, and because it is synthetic we know
+which five. The sanity block confirms the market looks like a market.
+
+```
+$ python -m src.generate
+
+STEP 1 SANITY CHECKS   (seed = 42, 30 vendors, 5 real = 17% base rate)
+  panel-wide daily vol   0.0181   (want ~0.018-0.022)
+  annualised vol         28.7%   (want ~28-35%)
+  mean pairwise corr     0.325   (want ~0.25-0.35)
+  calm/wild spread       1.38x
+  factor persistences    [0.97 0.89 0.8  0.72 0.63 0.55]   (slow -> fast)
+```
+
+**2. Run the naive backtest, the way a rushed analyst would.** No train/test split, keep the
+best of nine configs per vendor, rank by raw in-sample Sharpe. It gets fooled: the top-ranked
+vendor in the whole shortlist is a pure-noise one, and thirty-four times a zero-skill vendor
+outranks a genuine one.
+
+```
+$ python -m src.naive
+
+SUMMARY
+  top-ranked vendor overall:   vendor_22 -> fake  (best_sharpe 2.65)
+  best fake:                   vendor_22  (2.65, single 2.63)
+  fake-over-real inversions:   34   (zero-skill vendors outranking genuine ones)
+  mean best-minus-single gap:  0.34   (the cost of knob-twisting)
+```
+
+**3. Run the real pipeline.** Four gates in order, none of which ever reads the answer key. It
+throws out reconstructed history, pays for its own searches, drops vendors that cannot cover
+trading cost, and then opens the sealed holdout once.
+
+```
+$ python -m src.pipeline
+
+GATE BY GATE   (30 vendors in, 5 of them real)
+  1 provenance   8489 vendor-days of reconstructed history discarded
+  2 significance 5 survive, 60% real
+  3 economics    3 survive, 67% real
+  4 holdout      bought +0.607   rejected +0.006
+
+  recall: 40% of the real vendors found
+```
+
+The last line is the whole point. On 250 days that nothing in the pipeline ever touched, the
+vendors it bought return a Sharpe of +0.607 while the ones it rejected return +0.006. A desk
+running this process would see that gap on its own live data, with no answer key, and know the
+buy list was real. That is what the naive backtest, crowning a noise vendor, could never give it.
+
+Numbers move seed to seed, which is the point: run any module with `--sweep N` for the
 distribution rather than a single lucky or unlucky draw.
 
 ## Read NOTES.md for the generator design
