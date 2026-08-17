@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# stray full-panel export (regenerable)
+/returns_full.csv
