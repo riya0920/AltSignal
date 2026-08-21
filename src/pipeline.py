@@ -1,33 +1,4 @@
-"""AltSignal - the full pipeline. Five gates in order, one buy list, one number.
-
-Every module in this project answers a different question, and until now they ran separately.
-The order they run in is not cosmetic. Applying the economic gate before the significance gate
-ranks lucky noise at the top: in the capacity table, three NULL vendors posted the best
-breakeven and capacity in the shortlist, purely because their frictionless Sharpes happened to
-land near 1.9. Cost analysis correctly says "if that Sharpe were real it would be very
-profitable" - knowing it is not real is a different gate's job.
-
-So the gates run cheapest-and-most-powerful first, and each one narrows what the next may look
-at:
-
-  1  PROVENANCE   a vendor declaring a live-start date is scored only on data after it.
-                  Reconstructed history is not evidence. This runs first because it changes
-                  the data every later gate sees, not just the verdict.
-  2  SIGNIFICANCE Newey-West p-value on the ensemble book, then Benjamini-Hochberg across
-                  vendors. Controls the fraction of the buy list that is junk, rather than
-                  promising never to be wrong - the right framing when buying five things.
-  3  ECONOMICS    breakeven cost and capacity, on a turnover-controlled book. Kills vendors
-                  that are real and cannot pay for their own trading.
-  4  HOLDOUT      the sealed final 250 days, opened once, after the buy list is fixed.
-
-Gate order is enforced structurally: each gate receives only the vendors that survived the one
-before it, and the holdout window is sliced out of the data before gate 1 ever runs.
-
-THE OUTPUT THAT MATTERS
-Not accuracy - the answer key gives that away. It is whether the HOLDOUT would have told a
-desk the same thing without an answer key. If the bought vendors outperform the rejected ones
-on data nothing touched, then a real desk running this process gets an honest read on its own
-hit rate. That is the entire justification for a paper trial.
+"""AltSignal - the full pipeline with asynchronous latency integration.
 
 Run:  python -m src.pipeline
       python -m src.pipeline --sweep 30
@@ -47,15 +18,22 @@ from src.turnover import apply_rate
 
 HOLDOUT_DAYS = 250
 FDR_Q = 0.10
-TRADE_RATE = 0.20           # position smoothing; see src/turnover.py
-COST_BPS = 10.0             # assumed all-in trading cost
-MIN_BREAKEVEN = 30.0        # require real margin over the assumed cost, not a coin flip
+TRADE_RATE = 0.20
+COST_BPS = 10.0
+MIN_BREAKEVEN = 30.0
 NW_LAGS = 5
 TRADING_DAYS = 252
 
 
+def apply_lag(sig: np.ndarray, lag: int = 0) -> np.ndarray:
+    """Delays signal availability by `lag` trading days."""
+    if lag <= 0:
+        return sig
+    pad = np.zeros((lag, sig.shape[1]), dtype=sig.dtype)
+    return np.vstack([pad, sig[:-lag]])
+
+
 def book(sig):
-    """Turnover-controlled ensemble positions: all nine configs, then partial adjustment."""
     tgt = np.mean([weights(top_k(smooth(sig, s), k)) for _, s, k in CONFIGS], axis=0)
     return apply_rate(tgt, TRADE_RATE)
 
@@ -89,7 +67,6 @@ def benjamini_hochberg(pvals, q=FDR_Q):
 
 
 def breakeven_bps(pnl, traded, hi=200.0):
-    """Cost level at which the vendor stops making money, by bisection."""
     def net_mean(c):
         return (pnl - traded * (c / 10000.0)).mean()
     if net_mean(0.0) <= 0:
@@ -103,14 +80,19 @@ def breakeven_bps(pnl, traded, hi=200.0):
     return float((lo + hi) / 2)
 
 
-def run(returns, vendors, live_starts):
-    """Run all four gates. No ground truth is read anywhere in this function."""
+def run(returns, vendors, live_starts, vendor_lags=None):
+    if vendor_lags is None:
+        vendor_lags = {name: 0 for name in vendors}
+
     fwd = returns[1:]
-    cut = fwd.shape[0] - HOLDOUT_DAYS          # everything from cut onward is sealed
+    cut = fwd.shape[0] - HOLDOUT_DAYS
 
     rows = []
     for name, sig in vendors.items():
-        w = book(sig)
+        lag = int(vendor_lags.get(name, 0))
+        sig_delayed = apply_lag(sig, lag=lag)
+
+        w = book(sig_delayed)
         pnl = (w * fwd).sum(axis=1)
         traded = np.abs(np.diff(w, axis=0, prepend=0.0)).sum(axis=1)
 
@@ -123,6 +105,7 @@ def run(returns, vendors, live_starts):
         rows.append({
             "vendor": name,
             "live_start": ls,
+            "lag_days": lag,
             "days_used": len(res_pnl),
             "days_discarded": start,
             "gross_sharpe": _sharpe(res_pnl),
@@ -135,19 +118,16 @@ def run(returns, vendors, live_starts):
 
     df = pd.DataFrame(rows)
 
-    # --- GATE 2: significance, on everything that reached it ---
+    # --- GATE 2: significance ---
     df["pass_significance"] = df["p_value"] < 0.10
 
-    # --- GATE 3: economics, applied ONLY to significance survivors ---
-    # Order matters. Run on the unfiltered list, this gate promotes lucky nulls: a null with a
-    # frictionless Sharpe near 1.9 posts a better breakeven than every genuine vendor.
+    # --- GATE 3: economics ---
     df["pass_economics"] = df["pass_significance"] & (df["breakeven_bps"] >= MIN_BREAKEVEN)
     df["buy"] = df["pass_economics"]
     return df.sort_values("p_value").reset_index(drop=True)
 
 
 def score(df, true_ics):
-    """Attach ground truth AFTER every decision is made, for scoring only."""
     df = df.copy()
     df["true_ic"] = [true_ics[int(v[-2:])] for v in df["vendor"]]
     df["kind"] = np.where(df["true_ic"] > 0, "REAL", "fake")
@@ -176,7 +156,7 @@ def main():
         rows, t0 = [], time.time()
         for i, seed in enumerate(range(args.sweep), 1):
             u = build(seed)
-            df = run(u["returns"], u["vendors"], u["live_starts"])
+            df = run(u["returns"], u["vendors"], u["live_starts"], vendor_lags=u.get("lags"))
             _, s = score(df, u["true_ics"])
             s["seed"] = seed
             rows.append(s)
@@ -201,7 +181,10 @@ def main():
     vendors = dict(np.load("data/vendors.npz"))
     key = pd.read_csv("data/answer_key.csv")
 
-    df = run(returns, vendors, dict(zip(key["vendor"], key["live_start"])))
+    lags = dict(zip(key["vendor"], key["lag_days"])) if "lag_days" in key.columns else None
+    live_starts = dict(zip(key["vendor"], key["live_start"]))
+
+    df = run(returns, vendors, live_starts, vendor_lags=lags)
     df, s = score(df, key["true_ic"].tolist())
 
     Path("results").mkdir(exist_ok=True)
@@ -210,18 +193,15 @@ def main():
     pd.set_option("display.width", 175)
     print(f"FULL PIPELINE   (rate {TRADE_RATE}, cost {COST_BPS:.0f}bps, "
           f"BH q={FDR_Q}, min breakeven {MIN_BREAKEVEN:.0f}bps, {HOLDOUT_DAYS}d sealed)")
-    show = ["vendor", "kind", "true_ic", "days_discarded", "gross_sharpe", "p_value",
+    show = ["vendor", "kind", "true_ic", "lag_days", "days_discarded", "gross_sharpe", "p_value",
             "pass_significance", "breakeven_bps", "buy", "holdout_sharpe"]
     print(df[show].head(12).to_string(index=False, float_format=lambda x: f"{x:.3f}"))
 
     print(f"\nGATE BY GATE   (30 vendors in, 5 of them real)")
-    print(f"  1 provenance   {s['backfill_days_discarded']} vendor-days of reconstructed"
-          f" history discarded")
-    print(f"  2 significance {s['n_after_significance']} survive,"
-          f" {s['precision_after_significance']:.0%} real")
+    print(f"  1 provenance   {s['backfill_days_discarded']} vendor-days of reconstructed history discarded")
+    print(f"  2 significance {s['n_after_significance']} survive, {s['precision_after_significance']:.0%} real")
     print(f"  3 economics    {s['n_bought']} survive, {s['precision']:.0%} real")
-    print(f"  4 holdout      bought {s['holdout_bought']:+.3f}"
-          f"   rejected {s['holdout_rejected']:+.3f}")
+    print(f"  4 holdout      bought {s['holdout_bought']:+.3f}   rejected {s['holdout_rejected']:+.3f}")
     print(f"\n  recall: {s['recall']:.0%} of the real vendors found")
 
 
